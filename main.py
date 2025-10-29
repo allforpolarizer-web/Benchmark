@@ -15,6 +15,13 @@ import time
 from pathlib import Path
 from typing import Dict, Any, List
 
+# Windows 控制台编码兼容：尽量使用UTF-8并忽略不可编码字符
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='ignore')
+    sys.stderr.reconfigure(encoding='utf-8', errors='ignore')
+except Exception:
+    pass
+
 # 添加pipeline目录到Python路径
 pipeline_dir = Path(__file__).parent / "pipeline"
 sys.path.insert(0, str(pipeline_dir))
@@ -89,19 +96,39 @@ class BenchmarkPipeline:
             print(f"  ❌ 结构分析失败: {e}")
             return self._create_error_result(intention, structure_type, f"结构分析失败: {e}")
         
-        # 步骤5: 保存结果
-        print(f"\n步骤5: 保存分析结果")
+        # 步骤5: 使用本地OpenSees验证并保存结果
+        print(f"\n步骤5: 使用本地OpenSees验证并保存结果")
         try:
+            # 本地OpenSees验证
+            verification = self.postprocessor.verify_with_local_opensees(tcl_content)
+            ver_summary = (
+                f"本地OpenSees: {'找到' if verification.get('available') else '未找到'}；"
+                f"调用: {'是' if verification.get('invoked') else '否'}；"
+                f"结论: {'通过' if verification.get('passed') else '未通过'}；"
+                f"说明: {verification.get('message', '')}"
+            )
+            print("  验证: " + ver_summary)
+            
+            # 对比LLM结果和本地OpenSees结果
+            comparison = self.postprocessor.compare_results(analysis_result, verification)
+            if comparison.get('comparable'):
+                comparison_summary = f"可对比: 是；一致性: {'一致' if comparison.get('consistent') else '不一致'}"
+                print(f"  对比: {comparison_summary}")
+            else:
+                print(f"  对比: 不可对比")
+
             # 保存JSON格式
             json_file = self.postprocessor.save_analysis_result(
-                analysis_result, intention, structure_type
+                analysis_result, intention, structure_type, 
+                verification=verification, comparison=comparison
             )
             
             # 保存文本格式（更易读）
             gemini_response = analysis_result.get('think_response', '') + "\n" + \
                             analysis_result.get('code_response', '')
             text_file = self.postprocessor.save_text_result(
-                prompt, tcl_content, gemini_response, intention, structure_type
+                prompt, tcl_content, gemini_response, intention, structure_type, 
+                verification=verification, comparison=comparison
             )
             
             print(f"  JSON文件: {json_file}")
@@ -269,7 +296,14 @@ def main():
     try:
         # 初始化benchmark流水线
         pipeline = BenchmarkPipeline(api_key)
-        
+
+        # 非交互环境自动执行单个测试
+        if not sys.stdin.isatty() or os.environ.get("BENCHMARK_AUTO_RUN") == "1":
+            print("\n检测到非交互环境，自动运行单个测试...")
+            pipeline.run_single_benchmark()
+            print("\n自动运行完成。")
+            return
+
         # 显示菜单
         print("\n请选择运行模式:")
         print("1. 单个测试 (随机采样)")
