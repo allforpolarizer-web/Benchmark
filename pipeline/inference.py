@@ -15,10 +15,21 @@ sys.path.insert(0, str(project_root))
 from llm import OpenSeesSingleTurnAgent
 
 
+def _safe_print(msg: str):
+    try:
+        print(msg)
+    except Exception:
+        try:
+            print(msg.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore'))
+        except Exception:
+            pass
+
+
 class StructureAnalyzer:
     def __init__(self, api_key: Optional[str] = None):
         """初始化结构分析器"""
-        self.agent = OpenSeesSingleTurnAgent(api_key=api_key)
+        # 使用安全打印作为状态回调，避免Windows控制台编码错误导致崩溃
+        self.agent = OpenSeesSingleTurnAgent(api_key=api_key, status_callback=_safe_print)
     
     def analyze_structure(self, prompt: str, tcl_content: str, 
                          temp_tcl_file: str = None) -> Dict[str, Any]:
