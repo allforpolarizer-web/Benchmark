@@ -1,214 +1,319 @@
-#!/usr/bin/env python3
 """
-inference.py - 调用llm.py将prompt和TCL结构描述发给Gemini API进行分析
+通过llm.py调用gemini api根据prompt编写openseespy程序，运行并迭代修改
 """
-
+# -*- coding: utf-8 -*-
 import sys
 import os
-from pathlib import Path
-from typing import Dict, Any, Optional
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# 添加项目根目录到Python路径
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
-from llm import OpenSeesSingleTurnAgent
-
-
-def _safe_print(msg: str):
-    try:
-        print(msg)
-    except Exception:
-        try:
-            print(msg.encode('utf-8', errors='ignore').decode('utf-8', errors='ignore'))
-        except Exception:
-            pass
+import subprocess
+import json
+from typing import Optional, List, Dict, Tuple
+from llm import GeminiClient
+from pipeline.preprocess import EnvironmentManager
 
 
-class StructureAnalyzer:
-    def __init__(self, api_key: Optional[str] = None):
-        """初始化结构分析器"""
-        # 使用安全打印作为状态回调，避免Windows控制台编码错误导致崩溃
-        self.agent = OpenSeesSingleTurnAgent(api_key=api_key, status_callback=_safe_print)
+class InferenceEngine:
+    """迭代生成和运行openseespy程序"""
     
-    def analyze_structure(self, prompt: str, tcl_content: str, 
-                         temp_tcl_file: str = None) -> Dict[str, Any]:
+    # 中英文映射
+    INTENTION_MAP = {
+        "静力分析": "statics",
+        "模态分析": "modal",
+        "地震谱分析": "spectrum",
+        "时程分析": "timehistory"
+    }
+    
+    STRUCTURE_MAP = {
+        "框架": "frame",
+        "框架结构": "frame",
+        "剪力墙": "wall",
+        "剪力墙结构": "wall",
+        "框架剪力墙": "frame-wall",
+        "框架剪力墙结构": "frame-wall"
+    }
+    
+    def __init__(self, api_key: Optional[str] = None, output_dir: str = "output"):
+        self.client = GeminiClient(api_key=api_key)
+        self.output_dir = output_dir
+        self.env_manager = EnvironmentManager()
+        self.python_exe = None
+        self.max_iterations = 10
+    
+    def _translate_to_english(self, structure: str, intention: str) -> Tuple[str, str]:
+        """将中文结构类型和意图类型转换为英文"""
+        structure_key = structure.strip()
+        if structure_key.endswith("结构") and structure_key not in self.STRUCTURE_MAP:
+            structure_key = structure_key[:-2]
+        structure_en = self.STRUCTURE_MAP.get(structure_key, structure_key.lower().replace(" ", "-"))
+
+        intention_key = intention.strip()
+        intention_en = self.INTENTION_MAP.get(intention_key, intention_key.lower().replace(" ", "-"))
+        return structure_en, intention_en
+    
+    def _ensure_output_dir(self, folder_name: str):
+        """确保输出目录存在"""
+        folder_path = os.path.join(self.output_dir, folder_name)
+        os.makedirs(folder_path, exist_ok=True)
+        return folder_path
+    
+    def _get_python_executable(self) -> str:
+        """获取Python可执行文件路径"""
+        if self.python_exe is None:
+            self.python_exe = self.env_manager.get_python_executable()
+        return self.python_exe
+    
+    def _generate_code(self, prompt: str, iteration: int, previous_code: Optional[str] = None, 
+                      previous_error: Optional[str] = None) -> str:
         """
-        分析结构
+        生成openseespy代码
         
         Args:
-            prompt: 用户prompt
-            tcl_content: TCL结构描述内容
-            temp_tcl_file: 临时TCL文件路径（如果为None，会自动创建）
+            prompt: 用户需求prompt
+            iteration: 当前迭代次数
+            previous_code: 上一次的代码（如果有）
+            previous_error: 上一次运行错误（如果有）
         
         Returns:
-            分析结果字典
+            生成的代码
         """
-        # 如果没有提供临时文件路径，创建一个
-        if temp_tcl_file is None:
-            temp_tcl_file = self._create_temp_tcl_file(tcl_content)
+        if iteration == 1 or not previous_code:
+            # 第一次生成
+            system_prompt = f"""你是一个结构分析专家，擅长使用OpenSeesPy进行结构分析。
+
+用户需求：{prompt}
+
+请根据用户需求，使用OpenSeesPy编写一个完整的结构分析程序。要求：
+1. 使用openseespy.opensees模块
+2. 所有注释使用中文
+3. 代码完整，可以直接运行
+4. 包含必要的模型定义、分析步骤和结果输出
+5. 确保代码语法正确
+
+只输出Python代码，不要包含任何解释或markdown格式："""
+        else:
+            # 迭代修改
+            system_prompt = f"""你是一个结构分析专家，需要修复OpenSeesPy程序中的错误。
+
+用户需求：{prompt}
+
+上一次的代码：
+```python
+{previous_code}
+```
+
+运行错误信息：
+{previous_error}
+
+请根据错误信息修改代码，要求：
+1. 修复所有错误
+2. 保持代码完整可运行
+3. 所有注释使用中文
+4. 只输出修改后的完整Python代码，不要包含任何解释或markdown格式："""
+        
+        code = self.client.call(system_prompt)
+        
+        if not code:
+            raise RuntimeError("生成代码失败")
+        
+        # 清理代码（移除可能的markdown格式）
+        code = code.strip()
+        if code.startswith("```python"):
+            code = code[9:]
+        if code.startswith("```"):
+            code = code[3:]
+        if code.endswith("```"):
+            code = code[:-3]
+        code = code.strip()
+        
+        return code
+    
+    def _save_code(self, code: str, structure: str, intention: str, iteration: int, run_index: int) -> str:
+        """
+        保存代码到文件
+        
+        Returns:
+            保存的文件路径
+        """
+        # 转换为英文名称
+        structure_en, intention_en = self._translate_to_english(structure, intention)
+        
+        folder_name = f"{structure_en}-{intention_en}-{run_index}"
+        folder_path = self._ensure_output_dir(folder_name)
+        
+        filename = f"{structure_en}-{intention_en}-{run_index}-{iteration}.py"
+        filepath = os.path.join(folder_path, filename)
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(code)
+        
+        return filepath
+    
+    def _run_code(self, filepath: str) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        运行代码
+        
+        Returns:
+            (是否成功, 标准输出, 错误输出)
+        """
+        python_exe = self._get_python_executable()
         
         try:
-            # 调用OpenSees Agent进行分析
-            result = self.agent.process_single_turn(temp_tcl_file, prompt)
+            result = subprocess.run(
+                [python_exe, filepath],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                encoding='utf-8',
+                errors='ignore'
+            )
             
-            # 添加额外信息
-            result["prompt"] = prompt
-            result["tcl_content"] = tcl_content
-            result["temp_tcl_file"] = temp_tcl_file
+            success = result.returncode == 0
+            stdout = result.stdout if result.stdout else None
+            stderr = result.stderr if result.stderr else None
             
-            return result
-            
+            return success, stdout, stderr
+        except subprocess.TimeoutExpired:
+            return False, None, "程序运行超时（60秒）"
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"分析过程中发生错误: {str(e)}",
-                "prompt": prompt,
-                "tcl_content": tcl_content,
-                "temp_tcl_file": temp_tcl_file
-            }
+            return False, None, f"运行异常: {str(e)}"
     
-    def _create_temp_tcl_file(self, tcl_content: str) -> str:
-        """创建临时TCL文件"""
-        import tempfile
-        import time
-        
-        # 创建临时文件
-        timestamp = int(time.time())
-        temp_dir = Path("temp_opensees")
-        temp_dir.mkdir(exist_ok=True)
-        
-        temp_file = temp_dir / f"temp_structure_{timestamp}.tcl"
-        
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            f.write(tcl_content)
-        
-        return str(temp_file)
-    
-    def analyze_with_custom_prompt(self, tcl_content: str, custom_prompt: str = None) -> Dict[str, Any]:
+    def _analyze_result(self, success: bool, stdout: Optional[str], stderr: Optional[str]) -> Tuple[bool, Optional[str]]:
         """
-        使用自定义prompt分析结构
-        
-        Args:
-            tcl_content: TCL结构描述内容
-            custom_prompt: 自定义分析prompt
+        通过LLM分析运行结果，判断是否成功
         
         Returns:
-            分析结果字典
+            (是否成功, 错误信息或None)
         """
-        if custom_prompt is None:
-            custom_prompt = "请分析这个结构的内力、位移和模态特性"
+        if success:
+            # 即使返回码为0，也通过LLM确认是否真的成功
+            analysis_prompt = f"""请分析以下OpenSeesPy程序的运行结果，判断程序是否成功执行。
+
+标准输出：
+{stdout if stdout else "无输出"}
+
+错误输出：
+{stderr if stderr else "无错误"}
+
+请判断：
+1. 程序是否成功执行？
+2. 如果失败，请说明失败原因
+
+只回答"成功"或"失败：原因"，不要其他解释："""
+        else:
+            analysis_prompt = f"""请分析以下OpenSeesPy程序的运行错误：
+
+标准输出：
+{stdout if stdout else "无输出"}
+
+错误输出：
+{stderr if stderr else "无错误"}
+
+请提取关键错误信息，用于修复代码。只输出错误原因，不要其他解释："""
         
-        return self.analyze_structure(custom_prompt, tcl_content)
+        analysis = self.client.call(analysis_prompt)
+        
+        if not analysis:
+            # 如果LLM分析失败，使用简单的判断
+            return success, stderr
+        
+        analysis = analysis.strip()
+        
+        if "成功" in analysis or success:
+            return True, None
+        else:
+            return False, analysis or stderr
     
-    def batch_analyze(self, analysis_tasks: list) -> list:
+    def run(self, prompt: str, structure: str, intention: str, run_index: int) -> Dict:
         """
-        批量分析多个结构
+        运行推理流程
         
         Args:
-            analysis_tasks: 分析任务列表，每个任务包含prompt和tcl_content
+            prompt: 用户需求prompt
+            structure: 结构类型
+            intention: 用户意图
         
         Returns:
-            分析结果列表
+            包含迭代信息的字典
         """
-        results = []
+        print(f"\n{'='*60}")
+        print(f"开始推理流程: {structure}-{intention} (第 {run_index} 次)")
+        print(f"{'='*60}\n")
         
-        for i, task in enumerate(analysis_tasks):
-            print(f"正在分析第 {i+1}/{len(analysis_tasks)} 个结构...")
+        previous_code = None
+        previous_error = None
+        iterations_info = []
+        
+        for iteration in range(1, self.max_iterations + 1):
+            print(f"\n--- 迭代 {iteration}/{self.max_iterations} ---")
             
-            prompt = task.get("prompt", "结构分析")
-            tcl_content = task.get("tcl_content", "")
-            
-            result = self.analyze_structure(prompt, tcl_content)
-            results.append(result)
-            
-            # 添加任务索引
-            result["task_index"] = i
-        
-        return results
-    
-    def get_analysis_summary(self, result: Dict[str, Any]) -> str:
-        """获取分析结果摘要"""
-        summary = []
-        summary.append("=" * 50)
-        summary.append("结构分析结果摘要")
-        summary.append("=" * 50)
-        
-        summary.append(f"分析状态: {'成功' if result.get('success') else '失败'}")
-        summary.append(f"用户prompt: {result.get('prompt', 'N/A')}")
-        
-        if result.get('think_response'):
-            summary.append(f"思考过程: {result['think_response'][:200]}...")
-        
-        if result.get('execution_result'):
-            exec_result = result['execution_result']
-            summary.append(f"执行状态: {'成功' if exec_result.get('success') else '失败'}")
-            if exec_result.get('stdout'):
-                summary.append(f"输出: {exec_result['stdout'][:200]}...")
-        
-        if result.get('errors'):
-            summary.append("错误信息:")
-            for error in result['errors']:
-                summary.append(f"  - {error}")
-        
-        summary.append("=" * 50)
-        return "\n".join(summary)
+            try:
+                # 生成代码
+                print("正在生成代码...")
+                code = self._generate_code(prompt, iteration, previous_code, previous_error)
+                
+                # 保存代码
+                filepath = self._save_code(code, structure, intention, iteration, run_index)
+                print(f"代码已保存: {filepath}")
+                
+                # 运行代码
+                print("正在运行代码...")
+                success, stdout, stderr = self._run_code(filepath)
+                
+                # 分析结果
+                print("正在分析运行结果...")
+                is_success, error_info = self._analyze_result(success, stdout, stderr)
+                
+                iteration_info = {
+                    "iteration": iteration,
+                    "filepath": filepath,
+                    "success": is_success,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "error_info": error_info
+                }
+                iterations_info.append(iteration_info)
+                
+                if is_success:
+                    print(f"✅ 迭代 {iteration} 成功！")
+                    break
+                else:
+                    print(f"❌ 迭代 {iteration} 失败")
+                    if error_info:
+                        print(f"错误信息: {error_info}")
+                    
+                    if iteration < self.max_iterations:
+                        print("准备修改代码...")
+                        previous_code = code
+                        previous_error = error_info or stderr
+                    else:
+                        print("已达到最大迭代次数，停止迭代")
+            except Exception as e:
+                print(f"❌ 迭代 {iteration} 发生异常: {e}")
+                iteration_info = {
+                    "iteration": iteration,
+                    "filepath": None,
+                    "success": False,
+                    "error": str(e)
+                }
+                iterations_info.append(iteration_info)
 
+                previous_error = str(e)
 
-def main():
-    """测试函数"""
-    print("=== 结构分析器测试 ===")
-    
-    try:
-        analyzer = StructureAnalyzer()
+                if iteration < self.max_iterations:
+                    print("将在下一次迭代中重试生成代码...")
+                    continue
+                else:
+                    break
         
-        # 测试用的简单TCL内容
-        test_tcl = """
-# 简单框架结构测试
-wipe
-model basic -ndm 2 -ndf 3
-node 1 0.0 0.0
-node 2 4.0 0.0
-node 3 0.0 3.5
-node 4 4.0 3.5
-fix 1 1 1 0
-fix 2 1 1 0
-uniaxialMaterial Elastic 1 200000.0
-section Elastic 1 200000.0 2000.0 1000000.0
-geomTransf Linear 1
-element elasticBeamColumn 1 1 3 2000.0 200000.0 1000000.0 1
-element elasticBeamColumn 2 2 4 2000.0 200000.0 1000000.0 1
-element elasticBeamColumn 3 3 4 2000.0 200000.0 1000000.0 1
-pattern Plain 1 Linear {
-    load 3 0.0 -50.0 0.0
-    load 4 0.0 -50.0 0.0
-}
-system BandSPD
-numberer Plain
-constraints Plain
-integrator LoadControl 1.0
-algorithm Linear
-analysis Static
-analyze 1
-"""
+        result = {
+            "structure": structure,
+            "intention": intention,
+            "prompt": prompt,
+            "iterations": iterations_info,
+            "final_success": iterations_info[-1]["success"] if iterations_info else False,
+            "run_index": run_index
+        }
         
-        # 测试分析
-        test_prompt = "计算内力"
-        print(f"测试prompt: {test_prompt}")
-        print("开始分析...")
-        
-        result = analyzer.analyze_structure(test_prompt, test_tcl)
-        
-        # 显示结果摘要
-        summary = analyzer.get_analysis_summary(result)
-        print(summary)
-        
-    except ValueError as e:
-        print(f"❌ 初始化失败: {e}")
-        print("请设置环境变量: export GEMINI_API_KEY='your-key'")
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
+        return result
 
-
-if __name__ == "__main__":
-    main()
