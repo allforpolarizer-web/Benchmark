@@ -89,6 +89,7 @@ class InferenceEngine:
 3. 代码完整，可以直接运行
 4. 包含必要的模型定义、分析步骤和结果输出
 5. 确保代码语法正确
+6. 不要包含绘图、可视化、matplotlib等绘图相关的代码，只输出数值计算结果
 
 只输出Python代码，不要包含任何解释或markdown格式："""
         else:
@@ -109,7 +110,8 @@ class InferenceEngine:
 1. 修复所有错误
 2. 保持代码完整可运行
 3. 所有注释使用中文
-4. 只输出修改后的完整Python代码，不要包含任何解释或markdown格式："""
+4. 不要包含绘图、可视化、matplotlib等绘图相关的代码，只输出数值计算结果
+5. 只输出修改后的完整Python代码，不要包含任何解释或markdown格式："""
         
         code = self.client.call(system_prompt)
         
@@ -163,7 +165,7 @@ class InferenceEngine:
                 [python_exe, filepath],
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=300,  # 延长到5分钟
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -174,7 +176,7 @@ class InferenceEngine:
             
             return success, stdout, stderr
         except subprocess.TimeoutExpired:
-            return False, None, "程序运行超时（60秒）"
+            return False, None, "程序运行超时（300秒）"
         except Exception as e:
             return False, None, f"运行异常: {str(e)}"
     
