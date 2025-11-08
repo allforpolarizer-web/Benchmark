@@ -12,7 +12,7 @@ if not os.getenv('HTTP_PROXY') and not os.getenv('HTTPS_PROXY'):
 
 
 class GeminiClient:
-    def __init__(self, api_key: Optional[str] = None, status_callback=None, base_url: Optional[str] = None, timeout: int = 180, max_retries: int = 3):
+    def __init__(self, api_key: Optional[str] = None, status_callback=None, base_url: Optional[str] = None, timeout: int = 300, max_retries: int = 3):
         self.api_key = api_key or os.getenv('GEMINI_API_KEY')
         if not self.api_key:
             raise ValueError("需要设置GEMINI_API_KEY环境变量")
