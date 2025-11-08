@@ -165,7 +165,7 @@ class InferenceEngine:
                 [python_exe, filepath],
                 capture_output=True,
                 text=True,
-                timeout=300,  # 延长到5分钟
+                timeout=60,
                 encoding='utf-8',
                 errors='ignore'
             )
@@ -176,7 +176,7 @@ class InferenceEngine:
             
             return success, stdout, stderr
         except subprocess.TimeoutExpired:
-            return False, None, "程序运行超时（300秒）"
+            return False, None, "程序运行超时（60秒）"
         except Exception as e:
             return False, None, f"运行异常: {str(e)}"
     
